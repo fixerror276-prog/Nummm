@@ -1,5 +1,4 @@
 import asyncio
-import glob
 import json
 import os
 import threading
@@ -23,7 +22,7 @@ PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
 THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "2"))
 DUPLICATE_CAP = 2
 
-# EXTENDED SEARCH FIELDS
+# SEARCH FIELDS
 SEARCH_FIELDS = [
     "name", "firstName", "lastName", "middleName", "fullName",
     "fathersName", "motherName", "spouseName", "guardianName",
@@ -50,9 +49,6 @@ NUMBER_FIELDS = [
     "drivingLicense", "bankAccount", "accountNumber", "creditCardNumber",
     "upiId", "ssn", "taxId", "employeeId", "rationCard", "emergencyContactNumber"
 ]
-
-IDX_PHONE = "idx_phone"
-IDX_AADHAR = "idx_aadhar"
 
 REMOTE_INDEXES = {
     "phone": [f"{HF_INDEX_BASE}/idx_phone.{i}.parquet" for i in range(7)],
@@ -103,7 +99,6 @@ def _get_conn() -> duckdb.DuckDBPyConnection:
     return _conns[ident]
 
 
-# ── Dedup & Connected Records ───────────────────────────────────────────────
 def _person_key(row: dict) -> tuple:
     ph = (row.get("phoneNumber") or "").strip()
     ad = (row.get("aadharNumber") or "").strip()
@@ -145,8 +140,7 @@ def _cap_duplicates(rows: list[dict]) -> list[dict]:
     return out
 
 
-# ── Search Logic ────────────────────────────────────────────────────────────
-def _get_index_for_field(field: str) -> str | None:
+def _get_index_for_field(field: str):
     mapping = {
         "phoneNumber": "phone",
         "alternatePhone": "phone",
@@ -396,7 +390,7 @@ def format_result(row: dict) -> str:
                       "motherName", "spouseName", "gender", "dob", "age", "bloodGroup"]
     personal = [f"**{f}:** {row[f]}" for f in personal_fields if row.get(f)]
     if personal:
-        lines.append("### 👤 Personal Information")
+        lines.append("### Personal Information")
         lines.extend(personal)
         lines.append("")
     
@@ -404,7 +398,7 @@ def format_result(row: dict) -> str:
                      "email", "alternateEmail", "address", "city", "district", "state", "pincode"]
     contact = [f"**{f}:** {row[f]}" for f in contact_fields if row.get(f)]
     if contact:
-        lines.append("### 📞 Contact Information")
+        lines.append("### Contact Information")
         lines.extend(contact)
         lines.append("")
     
@@ -412,7 +406,7 @@ def format_result(row: dict) -> str:
                 "drivingLicense", "rationCard", "ssn"]
     ids = [f"**{f}:** {row[f]}" for f in id_fields if row.get(f)]
     if ids:
-        lines.append("### 🪪 ID Documents")
+        lines.append("### ID Documents")
         lines.extend(ids)
         lines.append("")
     
@@ -420,14 +414,14 @@ def format_result(row: dict) -> str:
                   "education", "qualification", "instituteName"]
     prof = [f"**{f}:** {row[f]}" for f in prof_fields if row.get(f)]
     if prof:
-        lines.append("### 💼 Professional")
+        lines.append("### Professional")
         lines.extend(prof)
         lines.append("")
     
     fin_fields = ["bankAccount", "ifscCode", "accountNumber", "upiId"]
     fin = [f"**{f}:** {row[f]}" for f in fin_fields if row.get(f)]
     if fin:
-        lines.append("### 💰 Financial")
+        lines.append("### Financial")
         lines.extend(fin)
         lines.append("")
     
@@ -440,7 +434,7 @@ def format_result(row: dict) -> str:
     displayed = set(personal_fields + contact_fields + id_fields + prof_fields + fin_fields)
     remaining = [f"**{f}:** {row[f]}" for f in all_fields if row.get(f) and f not in displayed]
     if remaining:
-        lines.append("### 📌 Additional Information")
+        lines.append("### Additional Information")
         lines.extend(remaining)
     
     return "\n\n".join(lines)
@@ -448,13 +442,13 @@ def format_result(row: dict) -> str:
 
 def search_ui(query: str, limit: int) -> str:
     if not query or not query.strip():
-        return "⚠️ Please enter a search query"
+        return "Please enter a search query"
     
     q = query.strip()
     try:
         data = _unified_search(q, int(limit))
     except Exception as e:
-        return f"❌ Error: {str(e)}"
+        return f"Error: {str(e)}"
     
     count = data.get("count", 0)
     results = data.get("results", [])
@@ -462,29 +456,13 @@ def search_ui(query: str, limit: int) -> str:
     query_type = data.get("query_type", "unknown")
     
     if not results:
-        return f"""🔍 **Query:** `{q}`  
-**Type:** {query_type}  
-**Searched:** {searched or 'None'}  
-
-❌ **No data found** for this query.
-
-💡 **Tips:**
-- Try phone number (10 digits)
-- Try Aadhaar number (12 digits)
-- Try full name
-- Try email address
-- Use specific fields via API"""
+        return f"Query: {q}\nType: {query_type}\nSearched: {searched or 'None'}\n\nNo data found."
     
-    header = f"""🔍 **Query:** `{q}`  
-**Type:** {query_type}  
-**Found:** {count} results  
-**Searched in:** {searched}
-**Available fields:** {len(SEARCH_FIELDS)}
-"""
+    header = f"Query: {q}\nType: {query_type}\nFound: {count} results\nSearched in: {searched}\nAvailable fields: {len(SEARCH_FIELDS)}\n"
     
     parts = [header]
     for i, row in enumerate(results, 1):
-        parts.append(f"---\n### Result {i}\n{format_result(row)}")
+        parts.append(f"---\nResult {i}\n{format_result(row)}")
     
     return "\n\n".join(parts)
 
@@ -499,8 +477,8 @@ def build_ui():
         .footer { text-align: center; color: #888; margin-top: 20px; }
         """
     ) as demo:
-        gr.Markdown("# 🔍 ICMR + HITEK Search API (Extended)", elem_classes="main-title")
-        gr.Markdown(f"Search **2.5 Billion+ records** with **{len(SEARCH_FIELDS)} searchable fields**", elem_classes="subtitle")
+        gr.Markdown("# ICMR + HITEK Search API (Extended)", elem_classes="main-title")
+        gr.Markdown(f"Search 2.5 Billion+ records with {len(SEARCH_FIELDS)} searchable fields", elem_classes="subtitle")
         
         with gr.Row():
             with gr.Column(scale=3):
@@ -515,7 +493,7 @@ def build_ui():
                     label="Max Results"
                 )
         
-        search_btn = gr.Button("🔍 Search", variant="primary", size="lg")
+        search_btn = gr.Button("Search", variant="primary", size="lg")
         output = gr.Markdown(label="Results")
         
         search_btn.click(
@@ -531,24 +509,28 @@ def build_ui():
         
         gr.Markdown("---")
         
-        with gr.Accordion("📊 Available Search Fields", open=False):
+        with gr.Accordion("Available Search Fields", open=False):
             fields_html = "<div style='display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px;'>"
             for field in SEARCH_FIELDS:
                 fields_html += f"<span style='background: #f0f0f0; padding: 3px 8px; border-radius: 4px; font-size: 0.8em;'>{field}</span>"
             fields_html += "</div>"
-            gr.Markdown(f"**Total Fields:** {len(SEARCH_FIELDS)}\n\n{fields_html}")
+            gr.Markdown(f"Total Fields: {len(SEARCH_FIELDS)}\n\n{fields_html}")
         
-        with gr.Accordion("📡 API Info", open=False):
-            gr.Markdown("""
-**Endpoints:**
-- `GET /search?q=<query>` — Smart search
-- `GET /search?field=<field>&q=<value>` — Field-specific
-- `GET /fields` — List all fields
-- `GET /health` — Health check
-- `GET /docs` — Swagger UI
+        with gr.Accordion("API Info", open=False):
+            gr.Markdown("Endpoints:\n- GET /search?q=query\n- GET /search?field=field&q=value\n- GET /fields\n- GET /health\n- GET /docs")
+        
+        gr.Markdown(
+            "---\n"
+            "<div class='footer'>"
+            "Developer: @kzr0x | Channel: @api_wallah | "
+            f"{len(SEARCH_FIELDS)} Fields Supported"
+            "</div>",
+            elem_classes="footer"
+        )
+    
+    return demo
 
-**Examples:**
-```bash
-GET /search?q=9876543210
-GET /search?field=name&q=Rahul&mode=contains
-GET /search?field=email&q=user@gmail.com
+
+# ── Mount Gradio on FastAPI ─────────────────────────────────────────────────
+demo = build_ui()
+app = gr.mount_gradio_app(fastapi_app, demo, path="/")
