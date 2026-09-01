@@ -23,44 +23,27 @@ PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
 THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "2"))
 DUPLICATE_CAP = 2
 
-# ✅ EXTENDED SEARCH FIELDS - Maximum possible fields
+# EXTENDED SEARCH FIELDS
 SEARCH_FIELDS = [
-    # Personal Information
     "name", "firstName", "lastName", "middleName", "fullName",
     "fathersName", "motherName", "spouseName", "guardianName",
     "gender", "dob", "age", "bloodGroup", "nationality", "religion", "caste",
-    
-    # Contact Information
     "phoneNumber", "alternatePhone", "otherNumber", "emergencyContact",
     "email", "alternateEmail",
     "address", "permanentAddress", "currentAddress", "officeAddress",
     "city", "town", "district", "state", "pincode", "country",
-    
-    # Government IDs
     "aadharNumber", "panNumber", "voterId", "passportNumber", 
     "drivingLicense", "rationCard", "ssn", "taxId", "employeeId",
-    
-    # Professional & Education
     "occupation", "profession", "designation", "companyName", "officeName",
     "education", "qualification", "instituteName", "university", "graduationYear",
-    
-    # Financial
     "bankAccount", "ifscCode", "accountNumber", "upiId", "creditCardNumber",
-    
-    # Family & Social
-    "familyMembers", "childrenCount", "maritalStatus", "fatherName", "motherName",
-    "spouseName", "guardianName", "emergencyContactName", "emergencyContactNumber",
-    
-    # Location Details
+    "familyMembers", "childrenCount", "maritalStatus",
     "locality", "landmark", "area", "sector", "colony", "village", "tehsil",
     "mandal", "zilla", "parish", "municipality", "ward",
-    
-    # Other Important Fields
     "source", "createdDate", "updatedDate", "status", "activeFlag",
     "relationship", "category", "subCategory", "type", "notes", "comments"
 ]
 
-# ✅ Extended Number Fields
 NUMBER_FIELDS = [
     "phoneNumber", "aadharNumber", "otherNumber", "alternatePhone",
     "emergencyContact", "panNumber", "voterId", "passportNumber",
@@ -70,15 +53,10 @@ NUMBER_FIELDS = [
 
 IDX_PHONE = "idx_phone"
 IDX_AADHAR = "idx_aadhar"
-IDX_PAN = "idx_pan"
-IDX_VOTER = "idx_voter"
 
 REMOTE_INDEXES = {
     "phone": [f"{HF_INDEX_BASE}/idx_phone.{i}.parquet" for i in range(7)],
     "aadhar": [f"{HF_INDEX_BASE}/idx_aadhar.{i}.parquet" for i in range(7)],
-    # ✅ Additional indexes (if available in your dataset)
-    # "pan": [f"{HF_INDEX_BASE}/idx_pan.{i}.parquet" for i in range(7)],
-    # "voter": [f"{HF_INDEX_BASE}/idx_voter.{i}.parquet" for i in range(7)],
 }
 
 # ── DuckDB Connection Pool ──────────────────────────────────────────────────
@@ -99,23 +77,10 @@ def _new_conn() -> duckdb.DuckDBPyConnection:
     con.execute("INSTALL parquet; LOAD parquet;")
     con.execute("INSTALL httpfs; LOAD httpfs;")
     
-    # Create sorted index views from remote HF parts
     for kind, urls in REMOTE_INDEXES.items():
         view = f"people_{kind}"
         lst = ", ".join(f"'{u}'" for u in urls)
         con.execute(f"CREATE OR REPLACE VIEW {view} AS SELECT * FROM read_parquet([{lst}])")
-    
-    # ✅ Create main view with all fields
-    try:
-        # Try to get all fields from the main dataset
-        all_urls = []
-        for kind in REMOTE_INDEXES:
-            all_urls.extend(REMOTE_INDEXES[kind])
-        if all_urls:
-            lst = ", ".join(f"'{u}'" for u in all_urls[:1])  # Just use first file
-            con.execute(f"CREATE OR REPLACE VIEW people_all AS SELECT * FROM read_parquet([{lst}]) LIMIT 1")
-    except:
-        pass
     
     con.execute(f"SET threads = {THREADS_PER_CONN}")
     return con
@@ -180,28 +145,23 @@ def _cap_duplicates(rows: list[dict]) -> list[dict]:
     return out
 
 
-# ── Enhanced Search Logic ────────────────────────────────────────────────────
+# ── Search Logic ────────────────────────────────────────────────────────────
 def _get_index_for_field(field: str) -> str | None:
-    """Determine which index to use for a field"""
     mapping = {
         "phoneNumber": "phone",
         "alternatePhone": "phone",
         "otherNumber": "phone",
         "emergencyContact": "phone",
         "aadharNumber": "aadhar",
-        "panNumber": "pan",
-        "voterId": "voter",
     }
     return mapping.get(field)
 
 
 def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
     if field not in SEARCH_FIELDS:
-        raise ValueError(f"Unknown field: {field}. Available: {', '.join(SEARCH_FIELDS)}")
+        raise ValueError(f"Unknown field: {field}")
     
     v = value.replace("'", "''")
-    
-    # ✅ Determine which view to use
     index_kind = _get_index_for_field(field)
     view_name = None
     
@@ -209,7 +169,6 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
         if index_kind and _idx_ready(index_kind):
             view_name = f"people_{index_kind}"
         else:
-            # Use first available index or main view
             for kind in REMOTE_INDEXES:
                 if _idx_ready(kind):
                     view_name = f"people_{kind}"
@@ -218,10 +177,9 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
         if view_name:
             sql = f"SELECT * FROM {view_name} WHERE {field} = '{v}' LIMIT {limit * DUPLICATE_CAP + 20}"
         else:
-            return {"field": field, "value": value, "mode": mode, "count": 0, "results": [], "error": "No index available"}
+            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
     
     elif mode == "contains":
-        # For contains search, use any available index
         for kind in REMOTE_INDEXES:
             if _idx_ready(kind):
                 view_name = f"people_{kind}"
@@ -231,9 +189,9 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
             v2 = v.replace("%", r"\%").replace("_", r"\_")
             sql = f"SELECT * FROM {view_name} WHERE {field} ILIKE '%{v2}%' ESCAPE '\\' LIMIT {limit * DUPLICATE_CAP + 20}"
         else:
-            return {"field": field, "value": value, "mode": mode, "count": 0, "results": [], "error": "No index available for contains search"}
+            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
     else:
-        raise ValueError(f"Unknown mode: {mode}. Use 'exact' or 'contains'")
+        raise ValueError(f"Unknown mode: {mode}")
 
     try:
         con = _get_conn()
@@ -256,18 +214,15 @@ def _unified_search(q: str, limit: int = 10) -> dict:
     all_rows = []
     searched = []
     
-    # ✅ Smart search based on query type
     if is_num:
-        # Search in number fields
         for field in ["phoneNumber", "alternatePhone", "otherNumber", "emergencyContact"]:
             if field in SEARCH_FIELDS:
                 r = _run_field_search(field, q, "exact", limit)
                 if r.get("results"):
                     all_rows.extend(r["results"])
                     searched.append(field)
-                    break  # Stop if found
+                    break
         
-        # If not found, try Aadhaar
         if not all_rows and "aadharNumber" in SEARCH_FIELDS:
             r = _run_field_search("aadharNumber", q, "exact", limit)
             if r.get("results"):
@@ -275,7 +230,6 @@ def _unified_search(q: str, limit: int = 10) -> dict:
                 searched.append("aadharNumber")
     
     elif is_email:
-        # Search in email fields
         for field in ["email", "alternateEmail"]:
             if field in SEARCH_FIELDS:
                 r = _run_field_search(field, q, "exact", limit)
@@ -285,7 +239,6 @@ def _unified_search(q: str, limit: int = 10) -> dict:
                     break
     
     else:
-        # Text search - try name and other fields
         for field in ["name", "fullName", "firstName", "lastName"]:
             if field in SEARCH_FIELDS:
                 r = _run_field_search(field, q, "contains", limit)
@@ -294,7 +247,6 @@ def _unified_search(q: str, limit: int = 10) -> dict:
                     searched.append(field)
                     break
         
-        # If name search fails, try other text fields
         if not all_rows:
             for field in ["address", "district", "city", "state", "town", "locality"]:
                 if field in SEARCH_FIELDS:
@@ -314,7 +266,7 @@ def _unified_search(q: str, limit: int = 10) -> dict:
     }
 
 
-# ── FastAPI (for API access) ────────────────────────────────────────────────
+# ── FastAPI ──────────────────────────────────────────────────────────────────
 fastapi_app = FastAPI(title="ICMR + HITEK Search API - Extended")
 
 
@@ -350,7 +302,6 @@ def health():
 
 @fastapi_app.get("/fields")
 def get_fields():
-    """Get all available search fields"""
     return {
         "total_fields": len(SEARCH_FIELDS),
         "search_fields": SEARCH_FIELDS,
@@ -364,7 +315,7 @@ async def search(
     q: str | None = Query(None),
     mobile: str | None = Query(None),
     field: str | None = Query(None),
-    mode: str = Query("exact", regex="^(exact|contains)$"),
+    mode: str = Query("exact"),
     limit: int = Query(10, ge=1, le=1000),
     pretty: bool = Query(True),
 ):
@@ -376,7 +327,7 @@ async def search(
     
     if field:
         if field not in SEARCH_FIELDS:
-            raise HTTPException(400, f"Field '{field}' not supported. Available: {', '.join(SEARCH_FIELDS[:20])}...")
+            raise HTTPException(400, f"Field '{field}' not supported")
         data = await loop.run_in_executor(pool, _run_field_search, field, q_val, mode, limit)
     else:
         data = await loop.run_in_executor(pool, _unified_search, q_val, limit)
@@ -427,7 +378,7 @@ async def pinger():
             try:
                 resp = await client.get(url)
                 if resp.status_code == 200:
-                    print(f"[Pinger] OK at {asyncio.get_event_loop().time()}")
+                    print(f"[Pinger] OK")
             except Exception as e:
                 print(f"[Pinger] Error: {e}")
 
@@ -437,12 +388,10 @@ async def startup_event():
     asyncio.create_task(pinger())
 
 
-# ── Enhanced Gradio UI ──────────────────────────────────────────────────────
+# ── Gradio UI ───────────────────────────────────────────────────────────────
 def format_result(row: dict) -> str:
-    """Format a single result record as readable text with all fields"""
     lines = []
     
-    # Personal Info section
     personal_fields = ["name", "fullName", "firstName", "lastName", "fathersName", 
                       "motherName", "spouseName", "gender", "dob", "age", "bloodGroup"]
     personal = [f"**{f}:** {row[f]}" for f in personal_fields if row.get(f)]
@@ -451,7 +400,6 @@ def format_result(row: dict) -> str:
         lines.extend(personal)
         lines.append("")
     
-    # Contact Info section
     contact_fields = ["phoneNumber", "alternatePhone", "otherNumber", "emergencyContact",
                      "email", "alternateEmail", "address", "city", "district", "state", "pincode"]
     contact = [f"**{f}:** {row[f]}" for f in contact_fields if row.get(f)]
@@ -460,7 +408,6 @@ def format_result(row: dict) -> str:
         lines.extend(contact)
         lines.append("")
     
-    # ID Documents section
     id_fields = ["aadharNumber", "panNumber", "voterId", "passportNumber", 
                 "drivingLicense", "rationCard", "ssn"]
     ids = [f"**{f}:** {row[f]}" for f in id_fields if row.get(f)]
@@ -469,7 +416,6 @@ def format_result(row: dict) -> str:
         lines.extend(ids)
         lines.append("")
     
-    # Professional section
     prof_fields = ["occupation", "profession", "designation", "companyName", 
                   "education", "qualification", "instituteName"]
     prof = [f"**{f}:** {row[f]}" for f in prof_fields if row.get(f)]
@@ -478,7 +424,6 @@ def format_result(row: dict) -> str:
         lines.extend(prof)
         lines.append("")
     
-    # Financial section
     fin_fields = ["bankAccount", "ifscCode", "accountNumber", "upiId"]
     fin = [f"**{f}:** {row[f]}" for f in fin_fields if row.get(f)]
     if fin:
@@ -486,13 +431,11 @@ def format_result(row: dict) -> str:
         lines.extend(fin)
         lines.append("")
     
-    # Connected numbers
     cn = row.get("connected_numbers", [])
     if cn:
         nums = ", ".join(f"{c['field']}={c['value']}" for c in cn)
         lines.append(f"**connected:** {nums}")
     
-    # Any remaining fields
     all_fields = set(SEARCH_FIELDS)
     displayed = set(personal_fields + contact_fields + id_fields + prof_fields + fin_fields)
     remaining = [f"**{f}:** {row[f]}" for f in all_fields if row.get(f) and f not in displayed]
@@ -505,7 +448,7 @@ def format_result(row: dict) -> str:
 
 def search_ui(query: str, limit: int) -> str:
     if not query or not query.strip():
-        return "⚠️ Please enter a search query - phone, aadhar, name, email, or any other field."
+        return "⚠️ Please enter a search query"
     
     q = query.strip()
     try:
@@ -526,11 +469,11 @@ def search_ui(query: str, limit: int) -> str:
 ❌ **No data found** for this query.
 
 💡 **Tips:**
-- Try searching with phone number (10 digits)
+- Try phone number (10 digits)
 - Try Aadhaar number (12 digits)
-- Try full name (if available in database)
-- Try email address (if available)
-- Use specific fields via API for better results"""
+- Try full name
+- Try email address
+- Use specific fields via API"""
     
     header = f"""🔍 **Query:** `{q}`  
 **Type:** {query_type}  
@@ -554,7 +497,6 @@ def build_ui():
         .main-title { text-align: center; margin-bottom: 0; }
         .subtitle { text-align: center; color: #666; margin-top: 0; }
         .footer { text-align: center; color: #888; margin-top: 20px; }
-        .stats { text-align: center; color: #555; font-size: 0.9em; margin: 10px 0; }
         """
     ) as demo:
         gr.Markdown("# 🔍 ICMR + HITEK Search API (Extended)", elem_classes="main-title")
@@ -565,4 +507,48 @@ def build_ui():
                 query_input = gr.Textbox(
                     label="Search Query",
                     placeholder="Phone, Aadhaar, Name, Email, PAN, Voter ID, or any other field...",
+                    lines=2
+                )
+            with gr.Column(scale=1):
+                limit_slider = gr.Slider(
+                    minimum=1, maximum=50, value=10, step=1,
+                    label="Max Results"
+                )
         
+        search_btn = gr.Button("🔍 Search", variant="primary", size="lg")
+        output = gr.Markdown(label="Results")
+        
+        search_btn.click(
+            fn=search_ui,
+            inputs=[query_input, limit_slider],
+            outputs=output
+        )
+        query_input.submit(
+            fn=search_ui,
+            inputs=[query_input, limit_slider],
+            outputs=output
+        )
+        
+        gr.Markdown("---")
+        
+        with gr.Accordion("📊 Available Search Fields", open=False):
+            fields_html = "<div style='display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px;'>"
+            for field in SEARCH_FIELDS:
+                fields_html += f"<span style='background: #f0f0f0; padding: 3px 8px; border-radius: 4px; font-size: 0.8em;'>{field}</span>"
+            fields_html += "</div>"
+            gr.Markdown(f"**Total Fields:** {len(SEARCH_FIELDS)}\n\n{fields_html}")
+        
+        with gr.Accordion("📡 API Info", open=False):
+            gr.Markdown("""
+**Endpoints:**
+- `GET /search?q=<query>` — Smart search
+- `GET /search?field=<field>&q=<value>` — Field-specific
+- `GET /fields` — List all fields
+- `GET /health` — Health check
+- `GET /docs` — Swagger UI
+
+**Examples:**
+```bash
+GET /search?q=9876543210
+GET /search?field=name&q=Rahul&mode=contains
+GET /search?field=email&q=user@gmail.com
