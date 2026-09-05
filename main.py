@@ -1,4 +1,5 @@
 import asyncio
+import glob
 import json
 import os
 import threading
@@ -7,7 +8,7 @@ from typing import Any
 
 import duckdb
 import gradio as gr
-import httpx
+import httpx  # <-- added for pinger
 from fastapi import FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel
 
@@ -22,33 +23,14 @@ PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
 THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "2"))
 DUPLICATE_CAP = 2
 
-# SEARCH FIELDS
 SEARCH_FIELDS = [
-    "name", "firstName", "lastName", "middleName", "fullName",
-    "fathersName", "motherName", "spouseName", "guardianName",
-    "gender", "dob", "age", "bloodGroup", "nationality", "religion", "caste",
-    "phoneNumber", "alternatePhone", "otherNumber", "emergencyContact",
-    "email", "alternateEmail",
-    "address", "permanentAddress", "currentAddress", "officeAddress",
-    "city", "town", "district", "state", "pincode", "country",
-    "aadharNumber", "panNumber", "voterId", "passportNumber", 
-    "drivingLicense", "rationCard", "ssn", "taxId", "employeeId",
-    "occupation", "profession", "designation", "companyName", "officeName",
-    "education", "qualification", "instituteName", "university", "graduationYear",
-    "bankAccount", "ifscCode", "accountNumber", "upiId", "creditCardNumber",
-    "familyMembers", "childrenCount", "maritalStatus",
-    "locality", "landmark", "area", "sector", "colony", "village", "tehsil",
-    "mandal", "zilla", "parish", "municipality", "ward",
-    "source", "createdDate", "updatedDate", "status", "activeFlag",
-    "relationship", "category", "subCategory", "type", "notes", "comments"
+    "name", "fathersName", "phoneNumber", "aadharNumber", "otherNumber",
+    "address", "district", "pincode", "state", "town", "source",
 ]
+NUMBER_FIELDS = ["phoneNumber", "aadharNumber", "otherNumber"]
 
-NUMBER_FIELDS = [
-    "phoneNumber", "aadharNumber", "otherNumber", "alternatePhone",
-    "emergencyContact", "panNumber", "voterId", "passportNumber",
-    "drivingLicense", "bankAccount", "accountNumber", "creditCardNumber",
-    "upiId", "ssn", "taxId", "employeeId", "rationCard", "emergencyContactNumber"
-]
+IDX_PHONE = "idx_phone"
+IDX_AADHAR = "idx_aadhar"
 
 REMOTE_INDEXES = {
     "phone": [f"{HF_INDEX_BASE}/idx_phone.{i}.parquet" for i in range(7)],
@@ -68,16 +50,16 @@ def _idx_ready(kind: str) -> bool:
 
 def _new_conn() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
+    # Vercel fix: set home & extension dir to /tmp
     con.execute("SET home_directory='/tmp'")
     con.execute("SET extension_directory='/tmp/duckdb_extensions'")
     con.execute("INSTALL parquet; LOAD parquet;")
     con.execute("INSTALL httpfs; LOAD httpfs;")
-    
+    # Create sorted index views from remote HF parts
     for kind, urls in REMOTE_INDEXES.items():
         view = f"people_{kind}"
         lst = ", ".join(f"'{u}'" for u in urls)
         con.execute(f"CREATE OR REPLACE VIEW {view} AS SELECT * FROM read_parquet([{lst}])")
-    
     con.execute(f"SET threads = {THREADS_PER_CONN}")
     return con
 
@@ -99,17 +81,13 @@ def _get_conn() -> duckdb.DuckDBPyConnection:
     return _conns[ident]
 
 
+# ── Dedup & Connected Records ───────────────────────────────────────────────
 def _person_key(row: dict) -> tuple:
     ph = (row.get("phoneNumber") or "").strip()
     ad = (row.get("aadharNumber") or "").strip()
-    name = (row.get("name") or row.get("fullName") or row.get("firstName") or "").strip()
-    fname = (row.get("fathersName") or row.get("fatherName") or "").strip()
-    
     if ph or ad:
         return (ph, ad)
-    if name or fname:
-        return (name, fname)
-    return (str(row.get("email", "")).strip(), "")
+    return (row.get("name") or "").strip(), (row.get("fathersName") or "").strip()
 
 
 def _connected_numbers(row: dict) -> list[dict]:
@@ -140,128 +118,67 @@ def _cap_duplicates(rows: list[dict]) -> list[dict]:
     return out
 
 
-def _get_index_for_field(field: str):
-    mapping = {
-        "phoneNumber": "phone",
-        "alternatePhone": "phone",
-        "otherNumber": "phone",
-        "emergencyContact": "phone",
-        "aadharNumber": "aadhar",
-    }
-    return mapping.get(field)
-
-
+# ── Search Logic ────────────────────────────────────────────────────────────
 def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
     if field not in SEARCH_FIELDS:
         raise ValueError(f"Unknown field: {field}")
-    
     v = value.replace("'", "''")
-    index_kind = _get_index_for_field(field)
-    view_name = None
-    
+
     if mode == "exact":
-        if index_kind and _idx_ready(index_kind):
-            view_name = f"people_{index_kind}"
-        else:
-            for kind in REMOTE_INDEXES:
-                if _idx_ready(kind):
-                    view_name = f"people_{kind}"
-                    break
-        
-        if view_name:
-            sql = f"SELECT * FROM {view_name} WHERE {field} = '{v}' LIMIT {limit * DUPLICATE_CAP + 20}"
+        if field == "phoneNumber" and _idx_ready("phone"):
+            view = "people_phone"
+        elif field == "aadharNumber" and _idx_ready("aadhar"):
+            view = "people_aadhar"
+        elif field == "otherNumber":
+            # otherNumber not sorted — skip to avoid slow scan
+            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
         else:
             return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
-    
+        sql = f"SELECT * FROM {view} WHERE {field} = '{v}' LIMIT {limit * DUPLICATE_CAP + 20}"
     elif mode == "contains":
-        for kind in REMOTE_INDEXES:
-            if _idx_ready(kind):
-                view_name = f"people_{kind}"
-                break
-        
-        if view_name:
-            v2 = v.replace("%", r"\%").replace("_", r"\_")
-            sql = f"SELECT * FROM {view_name} WHERE {field} ILIKE '%{v2}%' ESCAPE '\\' LIMIT {limit * DUPLICATE_CAP + 20}"
-        else:
+        if field == "name":
+            # Name search not available in remote-only mode
             return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
+        v2 = v.replace("%", r"\%").replace("_", r"\_")
+        sql = f"SELECT * FROM people_phone WHERE {field} ILIKE '%{v2}%' ESCAPE '\\' LIMIT {limit * DUPLICATE_CAP + 20}"
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
-    try:
-        con = _get_conn()
-        rows = con.execute(sql).fetchall()
-        cols = [d[0] for d in con.description]
-        results = _cap_duplicates([dict(zip(cols, r)) for r in rows])[:limit]
-        return {"field": field, "value": value, "mode": mode, "count": len(results), "results": results}
-    except Exception as e:
-        return {"field": field, "value": value, "mode": mode, "count": 0, "results": [], "error": str(e)}
+    con = _get_conn()
+    rows = con.execute(sql).fetchall()
+    cols = [d[0] for d in con.description]
+    results = _cap_duplicates([dict(zip(cols, r)) for r in rows])[:limit]
+    return {"field": field, "value": value, "mode": mode, "count": len(results), "results": results}
 
 
 def _unified_search(q: str, limit: int = 10) -> dict:
     q = q.strip()
-    if not q:
-        return {"query": q, "searched_fields": [], "count": 0, "results": []}
-    
     is_num = q.isdigit() and len(q) >= 8
-    is_email = '@' in q and '.' in q
-    
-    all_rows = []
-    searched = []
-    
+
     if is_num:
-        for field in ["phoneNumber", "alternatePhone", "otherNumber", "emergencyContact"]:
-            if field in SEARCH_FIELDS:
-                r = _run_field_search(field, q, "exact", limit)
-                if r.get("results"):
-                    all_rows.extend(r["results"])
-                    searched.append(field)
-                    break
-        
-        if not all_rows and "aadharNumber" in SEARCH_FIELDS:
+        all_rows = []
+        searched = []
+        # Phone index first (fast)
+        if _idx_ready("phone"):
+            r = _run_field_search("phoneNumber", q, "exact", limit)
+            all_rows.extend(r["results"])
+            searched.append("phoneNumber")
+        # Aadhar index second
+        if not all_rows and _idx_ready("aadhar"):
             r = _run_field_search("aadharNumber", q, "exact", limit)
-            if r.get("results"):
-                all_rows.extend(r["results"])
-                searched.append("aadharNumber")
-    
-    elif is_email:
-        for field in ["email", "alternateEmail"]:
-            if field in SEARCH_FIELDS:
-                r = _run_field_search(field, q, "exact", limit)
-                if r.get("results"):
-                    all_rows.extend(r["results"])
-                    searched.append(field)
-                    break
-    
+            all_rows.extend(r["results"])
+            searched.append("aadharNumber")
+        all_rows = _cap_duplicates(all_rows)[:limit]
+        return {
+            "query": q, "searched_fields": searched,
+            "count": len(all_rows), "results": all_rows,
+        }
     else:
-        for field in ["name", "fullName", "firstName", "lastName"]:
-            if field in SEARCH_FIELDS:
-                r = _run_field_search(field, q, "contains", limit)
-                if r.get("results"):
-                    all_rows.extend(r["results"])
-                    searched.append(field)
-                    break
-        
-        if not all_rows:
-            for field in ["address", "district", "city", "state", "town", "locality"]:
-                if field in SEARCH_FIELDS:
-                    r = _run_field_search(field, q, "contains", limit)
-                    if r.get("results"):
-                        all_rows.extend(r["results"])
-                        searched.append(field)
-                        break
-    
-    all_rows = _cap_duplicates(all_rows)[:limit]
-    return {
-        "query": q, 
-        "searched_fields": searched,
-        "count": len(all_rows), 
-        "results": all_rows,
-        "query_type": "number" if is_num else "email" if is_email else "text"
-    }
+        return {"query": q, "searched_fields": [], "count": 0, "results": []}
 
 
-# ── FastAPI ──────────────────────────────────────────────────────────────────
-fastapi_app = FastAPI(title="ICMR + HITEK Search API - Extended")
+# ── FastAPI (for API access) ────────────────────────────────────────────────
+fastapi_app = FastAPI(title="ICMR + HITEK Search API")
 
 
 class BatchRequest(BaseModel):
@@ -272,36 +189,21 @@ class BatchRequest(BaseModel):
 @fastapi_app.get("/")
 def root():
     return {
-        "app": "ICMR + HITEK Search API (Extended)",
-        "records": "2.5 Billion+",
-        "fields_supported": len(SEARCH_FIELDS),
-        "fields": SEARCH_FIELDS,
-        "number_fields": NUMBER_FIELDS,
-        "indexes": {k: _idx_ready(k) for k in REMOTE_INDEXES},
+        "app": "ICMR + HITEK Search API",
+        "records": 2_504_793_870,
+        "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
         "index_source": INDEX_SOURCE,
+        "columns": SEARCH_FIELDS,
         "docs": "/docs",
-        "developer": "@kzr0x | channel @api_wallah",
+        "developer": "@kzr0x | channel @api_wallah",   # <-- credit added
     }
 
 
 @fastapi_app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "fields_available": len(SEARCH_FIELDS),
-        "indexes": {k: _idx_ready(k) for k in REMOTE_INDEXES},
-        "index_source": INDEX_SOURCE
-    }
-
-
-@fastapi_app.get("/fields")
-def get_fields():
-    return {
-        "total_fields": len(SEARCH_FIELDS),
-        "search_fields": SEARCH_FIELDS,
-        "number_fields": NUMBER_FIELDS,
-        "indexed_fields": list(REMOTE_INDEXES.keys())
-    }
+    return {"status": "ok", "raw_database_required": False,
+            "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
+            "index_source": INDEX_SOURCE}
 
 
 @fastapi_app.get("/search")
@@ -315,23 +217,14 @@ async def search(
 ):
     q_val = (q or mobile or "").strip()
     if not q_val:
-        raise HTTPException(422, "Provide q or mobile parameter")
-    
+        raise HTTPException(422, "Provide q or mobile")
     loop = asyncio.get_running_loop()
-    
     if field:
-        if field not in SEARCH_FIELDS:
-            raise HTTPException(400, f"Field '{field}' not supported")
         data = await loop.run_in_executor(pool, _run_field_search, field, q_val, mode, limit)
     else:
         data = await loop.run_in_executor(pool, _unified_search, q_val, limit)
-    
-    result = {
-        "success": bool(data.get("count", 0)),
-        **data,
-        "number": q_val,
-        "total": data.get("count", 0)
-    }
+    result = {"success": bool(data["count"]), **data, "number": q_val,
+              "total": data["count"]}
     content = json.dumps(result, indent=2 if pretty else None, ensure_ascii=False)
     return Response(content=content, media_type="application/json")
 
@@ -342,7 +235,6 @@ async def search_parallel(req: BatchRequest):
         raise HTTPException(400, "queries must not be empty")
     if len(req.queries) > 50:
         raise HTTPException(400, "max 50 queries per batch")
-    
     loop = asyncio.get_running_loop()
     tasks = [
         loop.run_in_executor(pool, _run_field_search,
@@ -353,26 +245,25 @@ async def search_parallel(req: BatchRequest):
         for item in req.queries
     ]
     results = await asyncio.gather(*tasks)
-    return Response(
-        content=json.dumps({
-            "searches": len(req.queries),
-            "results": list(results)
-        }, indent=2, ensure_ascii=False),
-        media_type="application/json"
-    )
+    return Response(content=json.dumps({"searches": len(req.queries), "results": list(results)},
+                                       indent=2, ensure_ascii=False),
+                    media_type="application/json")
 
 
-# ── Pinger ──────────────────────────────────────────────────────────────────
+# ── Pinger (keeps app alive) ──────────────────────────────────────────────
 async def pinger():
-    port = os.getenv("PORT", "7860")
+    """Ping the /health endpoint every 2 minutes to prevent idle shutdown."""
+    port = os.getenv("PORT", "7860")  # default Gradio port; change if needed
     url = f"http://localhost:{port}/health"
     async with httpx.AsyncClient(timeout=10) as client:
         while True:
-            await asyncio.sleep(120)
+            await asyncio.sleep(120)  # 2 minutes
             try:
                 resp = await client.get(url)
                 if resp.status_code == 200:
-                    print(f"[Pinger] OK")
+                    print(f"[Pinger] OK at {asyncio.get_event_loop().time()}")
+                else:
+                    print(f"[Pinger] Unexpected status: {resp.status_code}")
             except Exception as e:
                 print(f"[Pinger] Error: {e}")
 
@@ -384,92 +275,48 @@ async def startup_event():
 
 # ── Gradio UI ───────────────────────────────────────────────────────────────
 def format_result(row: dict) -> str:
+    """Format a single result record as readable text."""
     lines = []
-    
-    personal_fields = ["name", "fullName", "firstName", "lastName", "fathersName", 
-                      "motherName", "spouseName", "gender", "dob", "age", "bloodGroup"]
-    personal = [f"**{f}:** {row[f]}" for f in personal_fields if row.get(f)]
-    if personal:
-        lines.append("### Personal Information")
-        lines.extend(personal)
-        lines.append("")
-    
-    contact_fields = ["phoneNumber", "alternatePhone", "otherNumber", "emergencyContact",
-                     "email", "alternateEmail", "address", "city", "district", "state", "pincode"]
-    contact = [f"**{f}:** {row[f]}" for f in contact_fields if row.get(f)]
-    if contact:
-        lines.append("### Contact Information")
-        lines.extend(contact)
-        lines.append("")
-    
-    id_fields = ["aadharNumber", "panNumber", "voterId", "passportNumber", 
-                "drivingLicense", "rationCard", "ssn"]
-    ids = [f"**{f}:** {row[f]}" for f in id_fields if row.get(f)]
-    if ids:
-        lines.append("### ID Documents")
-        lines.extend(ids)
-        lines.append("")
-    
-    prof_fields = ["occupation", "profession", "designation", "companyName", 
-                  "education", "qualification", "instituteName"]
-    prof = [f"**{f}:** {row[f]}" for f in prof_fields if row.get(f)]
-    if prof:
-        lines.append("### Professional")
-        lines.extend(prof)
-        lines.append("")
-    
-    fin_fields = ["bankAccount", "ifscCode", "accountNumber", "upiId"]
-    fin = [f"**{f}:** {row[f]}" for f in fin_fields if row.get(f)]
-    if fin:
-        lines.append("### Financial")
-        lines.extend(fin)
-        lines.append("")
-    
+    for field in SEARCH_FIELDS:
+        val = row.get(field, "")
+        if val:
+            lines.append(f"**{field}:** {val}")
+    # Connected numbers
     cn = row.get("connected_numbers", [])
     if cn:
         nums = ", ".join(f"{c['field']}={c['value']}" for c in cn)
         lines.append(f"**connected:** {nums}")
-    
-    all_fields = set(SEARCH_FIELDS)
-    displayed = set(personal_fields + contact_fields + id_fields + prof_fields + fin_fields)
-    remaining = [f"**{f}:** {row[f]}" for f in all_fields if row.get(f) and f not in displayed]
-    if remaining:
-        lines.append("### Additional Information")
-        lines.extend(remaining)
-    
     return "\n\n".join(lines)
 
 
 def search_ui(query: str, limit: int) -> str:
+    """Main Gradio search function."""
     if not query or not query.strip():
-        return "Please enter a search query"
-    
+        return "⚠️ Kuch toh search karo — phone, aadhar, ya name daalo."
+
     q = query.strip()
     try:
         data = _unified_search(q, int(limit))
     except Exception as e:
-        return f"Error: {str(e)}"
-    
-    count = data.get("count", 0)
-    results = data.get("results", [])
+        return f"❌ Error: {str(e)}"
+
+    count = data["count"]
+    results = data["results"]
     searched = ", ".join(data.get("searched_fields", []))
-    query_type = data.get("query_type", "unknown")
-    
+
     if not results:
-        return f"Query: {q}\nType: {query_type}\nSearched: {searched or 'None'}\n\nNo data found."
-    
-    header = f"Query: {q}\nType: {query_type}\nFound: {count} results\nSearched in: {searched}\nAvailable fields: {len(SEARCH_FIELDS)}\n"
-    
-    parts = [header]
+        return f"🔍 **Query:** `{q}`\n**Searched:** {searched}\n\n❌ **No data found** for this number."
+
+    header = f"🔍 **Query:** `{q}`  |  **Found:** {count} results  |  **Searched:** {searched}\n\n---\n\n"
+    parts = []
     for i, row in enumerate(results, 1):
-        parts.append(f"---\nResult {i}\n{format_result(row)}")
-    
-    return "\n\n".join(parts)
+        parts.append(f"### Result {i}\n{format_result(row)}")
+    return header + "\n\n---\n\n".join(parts)
 
 
 def build_ui():
     with gr.Blocks(
-        title="ICMR Search API - Extended",
+        title="ICMR Search API",
         theme=gr.themes.Soft(),
         css="""
         .main-title { text-align: center; margin-bottom: 0; }
@@ -477,57 +324,57 @@ def build_ui():
         .footer { text-align: center; color: #888; margin-top: 20px; }
         """
     ) as demo:
-        gr.Markdown("# ICMR + HITEK Search API (Extended)", elem_classes="main-title")
-        gr.Markdown(f"Search 2.5 Billion+ records with {len(SEARCH_FIELDS)} searchable fields", elem_classes="subtitle")
-        
+        gr.Markdown("# 🔍 ICMR + HITEK Search API", elem_classes="main-title")
+        gr.Markdown("Search **2.5 billion records** — phone, Aadhaar, name, address & more", elem_classes="subtitle")
+
         with gr.Row():
             with gr.Column(scale=3):
                 query_input = gr.Textbox(
                     label="Search Query",
-                    placeholder="Phone, Aadhaar, Name, Email, PAN, Voter ID, or any other field...",
-                    lines=2
+                    placeholder="Phone number, Aadhaar, ya name daalo...",
+                    lines=1,
                 )
             with gr.Column(scale=1):
                 limit_slider = gr.Slider(
                     minimum=1, maximum=50, value=10, step=1,
-                    label="Max Results"
+                    label="Max Results",
                 )
-        
-        search_btn = gr.Button("Search", variant="primary", size="lg")
+
+        search_btn = gr.Button("🔍 Search", variant="primary", size="lg")
         output = gr.Markdown(label="Results")
-        
+
         search_btn.click(
             fn=search_ui,
             inputs=[query_input, limit_slider],
-            outputs=output
+            outputs=output,
         )
         query_input.submit(
             fn=search_ui,
             inputs=[query_input, limit_slider],
-            outputs=output
+            outputs=output,
         )
-        
+
         gr.Markdown("---")
-        
-        with gr.Accordion("Available Search Fields", open=False):
-            fields_html = "<div style='display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px;'>"
-            for field in SEARCH_FIELDS:
-                fields_html += f"<span style='background: #f0f0f0; padding: 3px 8px; border-radius: 4px; font-size: 0.8em;'>{field}</span>"
-            fields_html += "</div>"
-            gr.Markdown(f"Total Fields: {len(SEARCH_FIELDS)}\n\n{fields_html}")
-        
-        with gr.Accordion("API Info", open=False):
-            gr.Markdown("Endpoints:\n- GET /search?q=query\n- GET /search?field=field&q=value\n- GET /fields\n- GET /health\n- GET /docs")
-        
+        with gr.Accordion("📡 API Info", open=False):
+            gr.Markdown("""
+**Endpoints** (via FastAPI):
+- `GET /search?q=<number>` — Phone/Aadhaar search
+- `GET /search?mobile=<number>` — Phone search (alias)
+- `GET /health` — Health check
+- `GET /docs` — Swagger UI
+
+**Source:** [HF Dataset](https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed)
+            """)
+
+        # Developer credit footer
         gr.Markdown(
             "---\n"
             "<div class='footer'>"
-            "Developer: @kzr0x | Channel: @api_wallah | "
-            f"{len(SEARCH_FIELDS)} Fields Supported"
+            "👨‍💻 **Developer:** @kzr0x  |  📢 **Channel:** @api_wallah"
             "</div>",
             elem_classes="footer"
         )
-    
+
     return demo
 
 
