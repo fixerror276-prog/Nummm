@@ -16,7 +16,7 @@ from pydantic import BaseModel
 BASE = os.path.dirname(os.path.abspath(__file__))
 HF_INDEX_BASE = os.environ.get(
     "ICMR_HF_INDEX_BASE",
-    "CutehackX/icrm-hitek-full-db-mixed-bucket",
+    "https://huggingface.co/datasets/Dead00arise/mynkk/resolve/main"
 ).rstrip("/")
 INDEX_SOURCE = os.environ.get("ICMR_INDEX_SOURCE", "remote").lower()
 PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
@@ -195,7 +195,7 @@ def root():
         "index_source": INDEX_SOURCE,
         "columns": SEARCH_FIELDS,
         "docs": "/docs",
-        "developer": "@kzr0x | channel @api_wallah",   # <-- credit added
+        "developer": "@Dead_Life_x | channel @Ogklyugg",   # <-- credit added
     }
 
 
@@ -363,14 +363,14 @@ def build_ui():
 - `GET /health` — Health check
 - `GET /docs` — Swagger UI
 
-**Source:** [HF Dataset](https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed)
+**Source:** [HF Dataset](https://huggingface.co/datasets/Dead00arise/mynkk)
             """)
 
         # Developer credit footer
         gr.Markdown(
             "---\n"
             "<div class='footer'>"
-            "👨‍💻 **Developer:** @kzr0x  |  📢 **Channel:** @api_wallah"
+            "👨‍💻 **Developer:** @Dead_Life_x  |  📢 **Channel:** @Ogklyugg"
             "</div>",
             elem_classes="footer"
         )
@@ -381,3 +381,4 @@ def build_ui():
 # ── Mount Gradio on FastAPI ─────────────────────────────────────────────────
 demo = build_ui()
 app = gr.mount_gradio_app(fastapi_app, demo, path="/")
+        
